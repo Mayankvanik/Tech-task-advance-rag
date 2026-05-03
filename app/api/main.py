@@ -17,6 +17,9 @@ from app.db.vector_store import get_vector_store
 from app.ingestion.document_processor import parse_document
 from app.agents.graph import run_pipeline
 
+from dotenv import load_dotenv
+load_dotenv() 
+
 settings = get_settings()
 
 

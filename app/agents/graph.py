@@ -86,6 +86,22 @@ def build_graph() -> StateGraph:
 _graph = None
 
 
+# Function for create Graph Diagram 
+
+app = build_graph()
+
+# 2. Generate the PNG data
+# draw_mermaid_png() uses an external API by default to render the image
+graph_image_data = app.get_graph().draw_mermaid_png()
+
+# 3. Save to a file
+with open("agent_workflow.png", "wb") as f:
+    f.write(graph_image_data)
+
+print("Agent diagram saved as 'agent_workflow.png'")
+
+
+
 def get_graph():
     global _graph
     if _graph is None:
