@@ -1,9 +1,11 @@
 import os
 import shutil
 import tempfile
+import json
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
@@ -15,7 +17,7 @@ from app.db.sqlite_store import (
 )
 from app.db.vector_store import get_vector_store
 from app.ingestion.document_processor import parse_document
-from app.agents.graph import run_pipeline
+from app.agents.graph import run_pipeline, stream_pipeline
 
 from dotenv import load_dotenv
 load_dotenv() 
@@ -26,7 +28,7 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    get_vector_store()  # warm up connection
+    get_vector_store()
     yield
 
 
@@ -45,7 +47,7 @@ app.add_middleware(
 )
 
 
-# ── Request / Response Models ─────────────────────────────────────────────────
+# ── Models ────────────────────────────────────────────────────────────────────
 
 class SessionCreate(BaseModel):
     user_id: str
@@ -63,27 +65,25 @@ class ChatResponse(BaseModel):
     session_id: str
     rewritten_query: str | None = None
     retrieval_strategy: str | None = None
+    from_cache: bool = False
 
 
-# ── Document Ingestion ────────────────────────────────────────────────────────
+# ── Documents ─────────────────────────────────────────────────────────────────
 
-@app.post("/documents/upload", summary="Upload and process a document")
+@app.post("/documents/upload")
 async def upload_document(file: UploadFile = File(...)):
     suffix = Path(file.filename).suffix.lower()
     if suffix not in {".pdf", ".md", ".html", ".htm", ".txt"}:
         raise HTTPException(400, f"Unsupported file type: {suffix}")
 
-    # Save to temp
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         shutil.copyfileobj(file.file, tmp)
         tmp_path = tmp.name
 
     try:
         chunks = await parse_document(tmp_path)
-        # Override source to original filename
         for c in chunks:
             c["metadata"]["source"] = file.filename
-
         store = get_vector_store()
         count = store.add_documents(chunks)
         return {"status": "success", "filename": file.filename, "chunks_indexed": count}
@@ -91,15 +91,15 @@ async def upload_document(file: UploadFile = File(...)):
         os.unlink(tmp_path)
 
 
-# ── Session Management ────────────────────────────────────────────────────────
+# ── Sessions ──────────────────────────────────────────────────────────────────
 
-@app.post("/sessions", summary="Start a new conversation session")
+@app.post("/sessions")
 async def new_session(body: SessionCreate):
     session_id = create_session(body.user_id)
     return {"session_id": session_id, "user_id": body.user_id}
 
 
-@app.get("/sessions/{session_id}", summary="Get session info")
+@app.get("/sessions/{session_id}")
 async def get_session_info(session_id: str):
     session = get_session(session_id)
     if not session:
@@ -107,12 +107,12 @@ async def get_session_info(session_id: str):
     return session
 
 
-@app.get("/users/{user_id}/sessions", summary="List all sessions for a user")
+@app.get("/users/{user_id}/sessions")
 async def user_sessions(user_id: str):
     return list_user_sessions(user_id)
 
 
-@app.get("/sessions/{session_id}/history", summary="Get chat history")
+@app.get("/sessions/{session_id}/history")
 async def chat_history(session_id: str, limit: int = 50):
     session = get_session(session_id)
     if not session:
@@ -124,22 +124,19 @@ async def chat_history(session_id: str, limit: int = 50):
     }
 
 
-# ── Chat ──────────────────────────────────────────────────────────────────────
+# ── Chat (non-streaming) ──────────────────────────────────────────────────────
 
-@app.post("/chat", response_model=ChatResponse, summary="Send a message")
+@app.post("/chat", response_model=ChatResponse)
 async def chat(body: ChatRequest):
     session = get_session(body.session_id)
     if not session:
         raise HTTPException(404, "Session not found")
-
     if session["user_id"] != body.user_id:
         raise HTTPException(403, "User does not own this session")
 
-    # Load history
     history = get_messages(body.session_id, limit=settings.max_context_messages)
     summary = session.get("summary")
 
-    # Run LangGraph pipeline
     result = await run_pipeline(
         session_id=body.session_id,
         user_id=body.user_id,
@@ -148,7 +145,6 @@ async def chat(body: ChatRequest):
         conversation_summary=summary,
     )
 
-    # Persist messages
     add_message(body.session_id, "user", body.query)
     add_message(body.session_id, "assistant", result["response"])
 
@@ -158,6 +154,44 @@ async def chat(body: ChatRequest):
         session_id=body.session_id,
         rewritten_query=result.get("rewritten_query"),
         retrieval_strategy=result.get("retrieval_strategy"),
+        from_cache=result.get("from_cache", False),
+    )
+
+
+# ── Chat (streaming SSE) ──────────────────────────────────────────────────────
+
+@app.post("/chat/stream")
+async def chat_stream(body: ChatRequest):
+    session = get_session(body.session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session["user_id"] != body.user_id:
+        raise HTTPException(403, "User does not own this session")
+
+    history = get_messages(body.session_id, limit=settings.max_context_messages)
+    summary = session.get("summary")
+
+    async def event_generator():
+        full_response = ""
+        async for chunk in stream_pipeline(
+            session_id=body.session_id,
+            user_id=body.user_id,
+            query=body.query,
+            chat_history=history,
+            conversation_summary=summary,
+        ):
+            if chunk["type"] == "done":
+                full_response = chunk["full_response"]
+            yield f"data: {json.dumps(chunk)}\n\n"
+
+        # Persist after stream completes
+        add_message(body.session_id, "user", body.query)
+        add_message(body.session_id, "assistant", full_response)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

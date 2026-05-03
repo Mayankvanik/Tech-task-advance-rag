@@ -61,14 +61,14 @@ STRATEGY: semantic/keyword/hybrid"""
 
     response = llm.invoke([HumanMessage(content=prompt)])
     text = response.content.strip()
-
+    
     needs_rewrite = "NEEDS_REWRITE: yes" in text.lower()
     strategy = "hybrid"
     if "STRATEGY: semantic" in text:
         strategy = "semantic"
     elif "STRATEGY: keyword" in text:
         strategy = "keyword"
-
+    
     return {"needs_rewrite": needs_rewrite, "retrieval_strategy": strategy}
 
 
