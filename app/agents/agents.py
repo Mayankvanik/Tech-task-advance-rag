@@ -14,8 +14,20 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from app.core.config import get_settings
 from app.core.state import ConversationState
+
+import logging
+logger = logging.getLogger(__name__)
 from app.db.vector_store import get_vector_store
 from app.db.sqlite_store import update_session_summary
+import json
+import re
+from app.core.prompt import (
+    QUERY_UNDERSTANDING_PROMPT,
+    QUERY_REWRITING_PROMPT,
+    CONTEXT_SYNTHESIS_SYSTEM_PROMPT,
+    CONTEXT_SYNTHESIS_USER_PROMPT,
+    CONVERSATION_SUMMARY_PROMPT,
+)
 
 settings = get_settings()
 
@@ -37,60 +49,75 @@ def _history_text(chat_history: list[dict], limit: int = 6) -> str:
     return "\n".join(f"{m['role'].upper()}: {m['content']}" for m in recent)
 
 
+def extract_json(text: str) -> str:
+    """Extract JSON from markdown/code block if present."""
+    # Remove ```json ... ``` or ``` ... ```
+    match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    
+    return text.strip()
+
 # ── Agent 1: Query Understanding ──────────────────────────────────────────────
+
+
 
 def query_understanding_agent(state: ConversationState) -> dict:
     """Determine if query needs context from history or rewriting."""
+    
     history = _history_text(state["chat_history"])
-
+    logger.debug(f"In query understanding agent, history is: {history}")
     if not history.strip():
-        # No history → direct query
-        return {"needs_rewrite": False, "retrieval_strategy": "hybrid"}
+        logger.info("No history available.")
+        return {
+            "needs_rewrite": False,
+            "retrieval_strategy": "hybrid",
+            "reason": "No history available"
+        }
 
-    prompt = f"""Analyze the user query in the context of the conversation.
-
-Conversation History:
-{history}
-
-Current Query: {state['query']}
-
-Answer in this exact format:
-NEEDS_REWRITE: yes/no
-REASON: one sentence
-STRATEGY: semantic/keyword/hybrid"""
+    prompt = QUERY_UNDERSTANDING_PROMPT.format(history=history, query=state['query'])
 
     response = llm.invoke([HumanMessage(content=prompt)])
-    text = response.content.strip()
+    logger.debug(f"query understanding response: {response.content}")
+    try:
+        clean_text = extract_json(response.content)
 
-    needs_rewrite = "NEEDS_REWRITE: yes" in text.lower()
-    strategy = "hybrid"
-    if "STRATEGY: semantic" in text:
-        strategy = "semantic"
-    elif "STRATEGY: keyword" in text:
-        strategy = "keyword"
+        parsed = json.loads(clean_text)
+        logger.debug(f"Parsed query understanding output: {parsed}")
 
-    return {"needs_rewrite": needs_rewrite, "retrieval_strategy": strategy}
+        result = {
+            "needs_rewrite": parsed.get("needs_rewrite", None),
+            "retrieval_strategy": parsed.get("retrieval_strategy", "hybrid")
+        }
+
+        logger.info(f"Final query understanding result: {result}")
+        return result
+
+
+    except json.JSONDecodeError:
+        logger.error(f"Failed to parse JSON from query understanding agent. Raw response: {response.content}")
+        # fallback (important for production reliability)
+        return {
+            "needs_rewrite": False,
+            "retrieval_strategy": "hybrid",
+            "reason": "Fallback due to invalid JSON response",
+            "raw_output": response.content  # useful for debugging
+        }
 
 
 # ── Agent 2: Query Rewriting ──────────────────────────────────────────────────
 
 def query_rewriting_agent(state: ConversationState) -> dict:
+    logger.debug("Entering query_rewriting_agent")
     """Reformulate query using conversation context."""
     if not state.get("needs_rewrite", False):
         return {"rewritten_query": state["query"]}
 
     history = _history_text(state["chat_history"])
-    prompt = f"""Rewrite the user query to be self-contained using conversation history.
-Keep it concise and search-optimized.
-
-Conversation History:
-{history}
-
-Original Query: {state['query']}
-
-Rewritten Query (only output the query, nothing else):"""
+    prompt = QUERY_REWRITING_PROMPT.format(history=history, query=state['query'])
 
     response = llm.invoke([HumanMessage(content=prompt)])
+    logger.debug(f"rewriting response: {response.content}")
     return {"rewritten_query": response.content.strip()}
 
 
@@ -146,19 +173,14 @@ def context_synthesis_agent(state: ConversationState) -> dict:
     if summary:
         memory_context = f"\nConversation Summary:\n{summary}\n"
 
-    system = """You are a helpful technical assistant. Answer based on the provided context.
-Be precise and cite sources using [Source N] notation. If information is not in context, say so."""
+    system = CONTEXT_SYNTHESIS_SYSTEM_PROMPT
 
-    user_prompt = f"""{memory_context}
-Recent Conversation:
-{history}
-
-Retrieved Context:
-{context}
-
-User Question: {state['query']}
-
-Answer:"""
+    user_prompt = CONTEXT_SYNTHESIS_USER_PROMPT.format(
+        memory_context=memory_context,
+        history=history,
+        context=context,
+        query=state['query']
+    )
 
     response = llm_creative.invoke([
         SystemMessage(content=system),
@@ -177,15 +199,10 @@ def conversation_summary_agent(state: ConversationState) -> dict:
         return {}
 
     history_text = _history_text(history, limit=len(history))
-    prompt = f"""Summarize the key points of this conversation concisely (max 200 words).
-Focus on: topics discussed, decisions made, user's main questions and answers given.
-
-Conversation:
-{history_text}
-
-Summary:"""
+    prompt = CONVERSATION_SUMMARY_PROMPT.format(history=history_text)
 
     response = llm.invoke([HumanMessage(content=prompt)])
+    logger.debug(f"conversation summary response: {response.content}")
     summary = response.content.strip()
 
     # Persist to SQLite

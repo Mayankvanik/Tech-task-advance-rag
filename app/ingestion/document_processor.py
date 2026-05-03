@@ -4,6 +4,7 @@ from pathlib import Path
 import pymupdf4llm
 from bs4 import BeautifulSoup
 from app.core.config import get_settings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 settings = get_settings()
 
@@ -61,40 +62,32 @@ def extract_metadata(text: str, filename: str, ext: str) -> dict:
     }
 
 
-def chunk_text(text: str, base_metadata: dict, chunk_size: int = 800, overlap: int = 100) -> list[dict]:
-    """Chunk text with overlap, tagging section headers per chunk."""
-    paragraphs = re.split(r"\n{2,}", text)
+def chunk_text(text: str, base_metadata: dict):
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=800,
+        chunk_overlap=100,
+        separators=["\n\n", "\n", ".", " "]
+    )
+
+    docs = splitter.create_documents([text])
+
     chunks = []
-    current_chunk = []
-    current_len = 0
     current_section = "Introduction"
 
-    for para in paragraphs:
-        para = para.strip()
-        if not para:
-            continue
+    for doc in docs:
+        content = doc.page_content.strip()
 
-        header_match = re.match(r"^#{1,3}\s+(.+)$", para)
+        # detect section
+        header_match = re.match(r"^#{1,3}\s+(.+)", content)
         if header_match:
             current_section = header_match.group(1)
 
-        words = para.split()
-        if current_len + len(words) > chunk_size:
-            if current_chunk:
-                chunks.append({
-                    "text": " ".join(current_chunk),
-                    "metadata": {**base_metadata, "section": current_section},
-                })
-                current_chunk = current_chunk[-overlap:]
-                current_len = len(current_chunk)
-
-        current_chunk.extend(words)
-        current_len += len(words)
-
-    if current_chunk:
         chunks.append({
-            "text": " ".join(current_chunk),
-            "metadata": {**base_metadata, "section": current_section},
+            "text": content,
+            "metadata": {
+                **base_metadata,
+                "section": current_section
+            }
         })
 
     return chunks

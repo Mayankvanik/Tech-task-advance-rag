@@ -20,6 +20,14 @@ from app.agents.graph import run_pipeline
 from dotenv import load_dotenv
 load_dotenv() 
 
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger(__name__)
+
 settings = get_settings()
 
 
@@ -69,8 +77,10 @@ class ChatResponse(BaseModel):
 
 @app.post("/documents/upload", summary="Upload and process a document")
 async def upload_document(file: UploadFile = File(...)):
+    logger.info(f"Uploading document: {file.filename}")
     suffix = Path(file.filename).suffix.lower()
     if suffix not in {".pdf", ".md", ".html", ".htm", ".txt"}:
+        logger.error(f"Unsupported file type uploaded: {suffix}")
         raise HTTPException(400, f"Unsupported file type: {suffix}")
 
     # Save to temp
@@ -86,6 +96,7 @@ async def upload_document(file: UploadFile = File(...)):
 
         store = get_vector_store()
         count = store.add_documents(chunks)
+        logger.info(f"Successfully processed {file.filename}: {count} chunks indexed.")
         return {"status": "success", "filename": file.filename, "chunks_indexed": count}
     finally:
         os.unlink(tmp_path)
@@ -95,14 +106,17 @@ async def upload_document(file: UploadFile = File(...)):
 
 @app.post("/sessions", summary="Start a new conversation session")
 async def new_session(body: SessionCreate):
+    logger.info(f"Creating new session for user_id: {body.user_id}")
     session_id = create_session(body.user_id)
     return {"session_id": session_id, "user_id": body.user_id}
 
 
 @app.get("/sessions/{session_id}", summary="Get session info")
 async def get_session_info(session_id: str):
+    logger.info(f"Fetching info for session_id: {session_id}")
     session = get_session(session_id)
     if not session:
+        logger.warning(f"Session not found: {session_id}")
         raise HTTPException(404, "Session not found")
     return session
 
@@ -114,8 +128,10 @@ async def user_sessions(user_id: str):
 
 @app.get("/sessions/{session_id}/history", summary="Get chat history")
 async def chat_history(session_id: str, limit: int = 50):
+    logger.info(f"Fetching chat history for session_id: {session_id} with limit {limit}")
     session = get_session(session_id)
     if not session:
+        logger.warning(f"Session not found: {session_id}")
         raise HTTPException(404, "Session not found")
     return {
         "session_id": session_id,
@@ -128,16 +144,20 @@ async def chat_history(session_id: str, limit: int = 50):
 
 @app.post("/chat", response_model=ChatResponse, summary="Send a message")
 async def chat(body: ChatRequest):
+    logger.info(f"Chat request received from user_id: {body.user_id} for session_id: {body.session_id}")
     session = get_session(body.session_id)
     if not session:
+        logger.warning(f"Chat failed: Session not found ({body.session_id})")
         raise HTTPException(404, "Session not found")
 
     if session["user_id"] != body.user_id:
+        logger.warning(f"Chat failed: User {body.user_id} does not own session {body.session_id}")
         raise HTTPException(403, "User does not own this session")
 
     # Load history
     history = get_messages(body.session_id, limit=settings.max_context_messages)
     summary = session.get("summary")
+    logger.debug(f"Loaded {len(history)} messages for session {body.session_id}")
 
     # Run LangGraph pipeline
     result = await run_pipeline(

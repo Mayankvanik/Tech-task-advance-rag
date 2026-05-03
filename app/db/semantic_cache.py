@@ -29,7 +29,7 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
-CACHE_COLLECTION = "semantic_cache"
+CACHE_COLLECTION = "semantic_cache_new"
 SIMILARITY_THRESHOLD = 0.92   # tune: higher = stricter match required
 
 

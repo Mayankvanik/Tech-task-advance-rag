@@ -31,6 +31,9 @@ from app.agents.agents import (
     memory_manager_agent,
 )
 from app.core.config import get_settings
+import logging
+
+logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
@@ -98,7 +101,7 @@ graph_image_data = app.get_graph().draw_mermaid_png()
 with open("agent_workflow.png", "wb") as f:
     f.write(graph_image_data)
 
-print("Agent diagram saved as 'agent_workflow.png'")
+logger.info("Agent diagram saved as 'agent_workflow.png'")
 
 
 
