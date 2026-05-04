@@ -9,6 +9,7 @@ class Settings(BaseSettings):
 
     # OpenAI
     llm_model: str = "gpt-4o-mini"
+    light_llm_model: str = "gpt-5.4-nano"
     embedding_model: str = "text-embedding-3-small"
     embedding_dim: int = 1536
 

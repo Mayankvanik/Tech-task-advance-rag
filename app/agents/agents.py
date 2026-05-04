@@ -32,7 +32,7 @@ from app.core.prompt import (
 settings = get_settings()
 
 llm = ChatOpenAI(
-    model=settings.llm_model,
+    model=settings.light_llm_model,
     openai_api_key=settings.openai_api_key,
     temperature=0.1,
 )
@@ -121,7 +121,38 @@ def query_rewriting_agent(state: ConversationState) -> dict:
     return {"rewritten_query": response.content.strip()}
 
 
-# ── Agent 3: Retrieval Router ─────────────────────────────────────────────────
+# ── Agent 3: Prefetch Retriever (parallel with understand) ───────────────────
+
+def prefetch_retriever_agent(state: ConversationState) -> dict:
+    """Hybrid search on the original query — runs in parallel with query_understanding.
+    Results are stored in `prefetched_docs` so they can be reused if no rewrite is needed.
+    """
+    store = get_vector_store()
+    query = state["query"]
+    logger.info(f"Prefetch retriever: hybrid search on original query='{query}'")
+    docs = store.hybrid_search(query, top_k=5)
+    logger.info(f"Prefetch retriever: fetched {len(docs)} docs")
+    return {"prefetched_docs": docs}
+
+
+# ── Agent 4: Decide — merge parallel branches ─────────────────────────────────
+
+def decide_agent(state: ConversationState) -> dict:
+    """Merge node that runs after both `understand` and `prefetch_retrieve` finish.
+
+    - needs_rewrite=False → promote prefetched_docs to retrieved_docs (skip retrieval)
+    - needs_rewrite=True  → leave retrieved_docs empty; `rewrite` → `retrieve` will fill it
+    """
+    needs_rewrite = state.get("needs_rewrite", False)
+    if not needs_rewrite:
+        prefetched = state.get("prefetched_docs", [])
+        logger.info(f"decide_agent: no rewrite needed — using {len(prefetched)} prefetched docs")
+        return {"retrieved_docs": prefetched}
+    logger.info("decide_agent: rewrite needed — fresh retrieval will follow")
+    return {}
+
+
+# ── Agent 5: Retrieval Router (kept for rewrite path) ─────────────────────────
 
 def retrieval_router_agent(state: ConversationState) -> dict:
     """Route to the correct retrieval strategy (already determined in understanding)."""
@@ -130,13 +161,16 @@ def retrieval_router_agent(state: ConversationState) -> dict:
     return {"retrieval_strategy": strategy}
 
 
-# ── Agent 4: Retriever ────────────────────────────────────────────────────────
+# ── Agent 6: Retriever (rewrite path only) ───────────────────────────────────
 
 def retriever_agent(state: ConversationState) -> dict:
-    """Fetch documents from Qdrant using the chosen strategy."""
+    """Fetch documents from Qdrant using the chosen strategy.
+    Only executed on the rewrite path (needs_rewrite=True).
+    """
     store = get_vector_store()
     query = state.get("rewritten_query") or state["query"]
     strategy = state.get("retrieval_strategy", "hybrid")
+    logger.info(f"retriever_agent: strategy={strategy}, query='{query}'")
 
     if strategy == "semantic":
         docs = store.semantic_search(query, top_k=5)
@@ -145,6 +179,7 @@ def retriever_agent(state: ConversationState) -> dict:
     else:
         docs = store.hybrid_search(query, top_k=5)
 
+    logger.info(f"retriever_agent: fetched {len(docs)} docs")
     return {"retrieved_docs": docs}
 
 

@@ -1,31 +1,30 @@
 """
 LangGraph Orchestrator — wires all agents into a StateGraph.
 
-Flow:
-  query_understanding
-       ↓
-  query_rewriting  (skipped if no rewrite needed)
-       ↓
-  retrieval_router
-       ↓
-  retriever
-       ↓
-  context_synthesis
-       ↓
-  conversation_summary  (conditional: only if long conversation)
-       ↓
-  memory_manager
-       ↓
-  END
+Optimized parallel flow:
+
+  START
+   ├──► understand         (LLM: detect needs_rewrite)
+   └──► prefetch           (hybrid search on original query)
+          ↓  (both complete, merge at decide)
+       decide
+        ├── needs_rewrite=False ──► synthesize  (prefetched docs reused, no extra LLM call)
+        └── needs_rewrite=True  ──► rewrite ──► route ──► retrieve ──► synthesize
+                                       ↓
+                               conversation_summary  (conditional)
+                                       ↓
+                               memory_manager  ──► END
 """
 
-from langgraph.graph import StateGraph, END
+from langgraph.graph import StateGraph, END, START
 from app.core.state import ConversationState
 from app.agents.agents import (
     query_understanding_agent,
     query_rewriting_agent,
     retrieval_router_agent,
     retriever_agent,
+    prefetch_retriever_agent,
+    decide_agent,
     context_synthesis_agent,
     conversation_summary_agent,
     memory_manager_agent,
@@ -39,7 +38,8 @@ settings = get_settings()
 
 
 def should_rewrite(state: ConversationState) -> str:
-    return "rewrite" if state.get("needs_rewrite", False) else "route"
+    """After decide_agent runs, route to synthesize directly or go through rewrite."""
+    return "rewrite" if state.get("needs_rewrite", False) else "synthesize"
 
 
 def should_summarize(state: ConversationState) -> str:
@@ -51,6 +51,8 @@ def build_graph() -> StateGraph:
 
     # Register nodes
     graph.add_node("understand", query_understanding_agent)
+    graph.add_node("prefetch", prefetch_retriever_agent)
+    graph.add_node("decide", decide_agent)
     graph.add_node("rewrite", query_rewriting_agent)
     graph.add_node("route", retrieval_router_agent)
     graph.add_node("retrieve", retriever_agent)
@@ -58,21 +60,29 @@ def build_graph() -> StateGraph:
     graph.add_node("summarize", conversation_summary_agent)
     graph.add_node("memory", memory_manager_agent)
 
-    # Entry point
-    graph.set_entry_point("understand")
+    # ── Parallel fan-out from START ───────────────────────────────────────────
+    # Both `understand` (LLM intent detection) and `prefetch` (hybrid search)
+    # kick off simultaneously so retrieval never waits on the LLM.
+    graph.add_edge(START, "understand")
+    graph.add_edge(START, "prefetch")
 
-    # Conditional: rewrite or go straight to route
+    # ── Merge: both branches must complete before `decide` runs ──────────────
+    graph.add_edge("understand", "decide")
+    graph.add_edge("prefetch", "decide")
+
+    # ── decide → synthesize (fast path) OR → rewrite (slow path) ─────────────
     graph.add_conditional_edges(
-        "understand",
+        "decide",
         should_rewrite,
-        {"rewrite": "rewrite", "route": "route"},
+        {"synthesize": "synthesize", "rewrite": "rewrite"},
     )
 
+    # ── Slow path: rewrite → route → fresh retrieve → synthesize ─────────────
     graph.add_edge("rewrite", "route")
     graph.add_edge("route", "retrieve")
     graph.add_edge("retrieve", "synthesize")
 
-    # Conditional: summarize or go straight to memory
+    # ── Post-synthesis: optional summarization, then memory ──────────────────
     graph.add_conditional_edges(
         "synthesize",
         should_summarize,
@@ -129,6 +139,7 @@ async def run_pipeline(
         "rewritten_query": None,
         "needs_rewrite": False,
         "retrieval_strategy": "hybrid",
+        "prefetched_docs": [],
         "retrieved_docs": [],
         "chat_history": chat_history,
         "conversation_summary": conversation_summary,
@@ -186,6 +197,7 @@ async def run_pipeline(
         "rewritten_query": None,
         "needs_rewrite": False,
         "retrieval_strategy": "hybrid",
+        "prefetched_docs": [],
         "retrieved_docs": [],
         "chat_history": chat_history,
         "conversation_summary": conversation_summary,

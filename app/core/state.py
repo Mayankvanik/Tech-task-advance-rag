@@ -14,7 +14,8 @@ class ConversationState(TypedDict):
     retrieval_strategy: str  # "semantic", "keyword", "hybrid"
 
     # Retrieval
-    retrieved_docs: list[dict]
+    prefetched_docs: list[dict]   # hybrid-search on original query (parallel path)
+    retrieved_docs: list[dict]    # final docs used by synthesizer
 
     # Memory & history
     chat_history: list[dict]
