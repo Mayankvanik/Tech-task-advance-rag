@@ -1,13 +1,25 @@
 # Conversational RAG System
 
-Multi-user RAG system with LangGraph orchestration, persistent memory, and hybrid search.
+Multi-user RAG system with LangGraph orchestration, streaming, persistent memory, and hybrid search.
 
 ---
 
 ## Architecture
 
 ```text
-User → Streamlit UI → FastAPI → Semantic Cache (Hit? → Return) → LangGraph Pipeline → Qdrant + SQLite
+User → Streamlit UI → FastAPI
+                        │
+                        ▼
+                 Semantic Cache
+           (Matches previous question?)
+                 /              \
+          Yes (Hit)             No (Miss)
+             │                      │
+             ▼                      ▼
+       Return Instantly     LangGraph Pipeline
+      (Bypass AI Agents)            │
+                                    ▼
+                             Qdrant + SQLite
 ```
 
 ### LangGraph Agent Flow
@@ -51,6 +63,33 @@ User → Streamlit UI → FastAPI → Semantic Cache (Hit? → Return) → LangG
                    │
                   END
 ```
+
+### Memory & State Management
+
+The system uses a highly optimized **Summary Buffer with Sliding Window** approach combined with **User Preference Extraction** to manage context:
+
+- **Conversation State**: The LangGraph pipeline orchestrates data using a typed `ConversationState` that holds the active `chat_history`, the long-term `conversation_summary`, and persistent `user_preferences`.
+- **Sliding Window**: To keep LLM token limits strictly under control, the FastAPI layer only loads the `N` most recent messages into the active `chat_history`.
+- **Summary Buffer**: When a conversation gets too long (exceeds `summary_threshold`), the `summarize` agent condenses the older history into a dense text summary. This summary is stored in SQLite and injected into the LLM prompt, ensuring no old context is forgotten even when it slides out of the active window.
+- **Auto-Extracted User Preferences**: During the summarization phase, the system uses an LLM call to automatically extract any explicitly or implicitly stated user preferences (e.g., tone, formatting, detail level). These are persisted in SQLite under the user's ID (not just the session ID), meaning the AI remembers how the user likes their answers formatted across *all* of their separate chat sessions!
+
+### LLM
+
+The system uses a dual-LLM strategy to balance cost, latency, and reasoning capability:
+- **Fast & Cheap (Reasoning/Routing)**: A lighter model is used for intent detection, query understanding, and routing tasks where speed is critical and the logic is straightforward.
+- **Accurate & Creative (Synthesis)**: A more powerful reasoning model is used for the final context synthesis, ensuring high-quality, accurate, and well-cited answers based on the retrieved data.
+
+### Observability
+
+- **LangSmith Integration**: The system is fully instrumented with LangSmith for real-time observability, trace logging, and agent performance monitoring. By providing the `LANGCHAIN_TRACING_V2` and `LANGCHAIN_API_KEY` in the `.env` file, every agent interaction and LangGraph trace is recorded for deep debugging and performance evaluation.
+
+### Vector DB Collections
+
+The system utilizes two distinct collections within Qdrant to handle different aspects of the RAG pipeline:
+- **`documents`**: Stores the processed chunks of uploaded documents (PDFs, Markdown, etc.) for retrieval during the synthesis phase.
+- **`semantic_cache`**: Stores previously asked user questions. When a question is asked, its embedding is compared against this collection. If a match is found, the pre-stored answer and sources (kept in the point's metadata) are returned instantly, bypassing the entire generation pipeline.
+
+
 
 ### Tech Stack
 
@@ -164,7 +203,7 @@ print(resp["sources"])
 
 ## Key Design Decisions
 
-- **Semantic Caching**: Previous Q&A interactions are cached. Before invoking the LangGraph pipeline, the system checks for semantically similar queries. If found, it returns the cached response immediately, bypassing the LLM and saving time/cost.
+- **Semantic Caching**: The system first checks new queries against a database of previously asked questions. If it finds an exact or *semantically similar* match (same meaning, different words), it immediately returns the cached answer. This completely bypasses the LangGraph agents and LLMs, making responses instantaneous and saving API costs.
 - **Parallel execution**: Intent detection (`understand`) and initial retrieval (`prefetch`) run concurrently from the start, minimizing latency before deciding whether to rewrite the query.
 - **Hybrid search** = Dense cosine (Qdrant) + BM25 re-rank. Balances semantic and keyword matching.
 - **Query rewriting** only triggers when history exists and the query is ambiguous — saves LLM calls.

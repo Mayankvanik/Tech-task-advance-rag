@@ -37,12 +37,14 @@ llm = ChatOpenAI(
     model=settings.light_llm_model,
     openai_api_key=settings.openai_api_key,
     temperature=0.1,
+    max_tokens=6000,
 )
 
 llm_creative = ChatOpenAI(
     model=settings.llm_model,
     openai_api_key=settings.openai_api_key,
     temperature=0.4,
+    max_tokens=6000,
 )
 
 
