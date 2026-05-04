@@ -74,16 +74,17 @@ User → Streamlit UI → FastAPI → Semantic Cache (Hit? → Return) → LangG
 
 ```bash
 cd rag_system
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-pip install -r requirements.txt
+uv init
+uv venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+uv sync
 ```
 
 ### 2. Configure environment
 
 ```bash
 cp .env.example .env
-# Edit .env — add your OPENAI_API_KEY and LLAMA_CLOUD_API_KEY
+# Edit .env — add your API_KEYS 
 ```
 
 ### 3. Start Qdrant (Docker)
@@ -98,7 +99,7 @@ docker-compose up -d
 
 ```bash
 cd ..  # back to project root
-python run_api.py
+uv run run_api.py
 # API docs: http://localhost:8000/docs
 ```
 
