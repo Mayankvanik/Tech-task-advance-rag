@@ -73,6 +73,22 @@ The system uses a highly optimized **Summary Buffer with Sliding Window** approa
 - **Summary Buffer**: When a conversation gets too long (exceeds `summary_threshold`), the `summarize` agent condenses the older history into a dense text summary. This summary is stored in SQLite and injected into the LLM prompt, ensuring no old context is forgotten even when it slides out of the active window.
 - **Auto-Extracted User Preferences**: During the summarization phase, the system uses an LLM call to automatically extract any explicitly or implicitly stated user preferences (e.g., tone, formatting, detail level). These are persisted in SQLite under the user's ID (not just the session ID), meaning the AI remembers how the user likes their answers formatted across *all* of their separate chat sessions!
 
+### Chunking and Retrieval
+
+**Document Ingestion & Chunking:**
+- Documents are parsed per format: **PDFs** are converted to clean Markdown via `pymupdf4llm` (preserving headers, tables, and code blocks); **HTML** has noise tags (`script`, `style`, `nav`, `footer`) stripped via BeautifulSoup; **Markdown/TXT** are read directly.
+- Text is split using LangChain's `RecursiveCharacterTextSplitter` with `chunk_size=800` and `chunk_overlap=100`, using natural separators (`\n\n`, `\n`, `.`, ` `) to avoid breaking mid-sentence.
+- Each chunk carries rich metadata: `source`, `doc_type`, `version` (auto-detected), `section` (tracked by walking through markdown headers), and a `has_code` flag.
+
+**Retrieval Strategies (selected per query by `query_understanding_agent`):**
+- **Semantic:** Pure dense vector search — query is embedded with `text-embedding-3-small` (1536d) and retrieved from Qdrant using Cosine Similarity.
+- **Keyword:** Runs via the hybrid path but weights BM25 more heavily, ideal for exact technical terms, IDs, or error codes.
+- **Hybrid (default):** Fetches `top_k × 3` semantic candidates from Qdrant, then re-ranks them using **BM25 Okapi** in a weighted combination:
+  ```
+  final_score = 0.6 × semantic_score + 0.4 × bm25_score_normalized
+  ```
+  The top `top_k` results are returned. This balances conceptual recall (dense) with precise keyword matching (sparse).
+
 ### LLM
 
 The system uses a dual-LLM strategy to balance cost, latency, and reasoning capability:
@@ -88,7 +104,6 @@ The system uses a dual-LLM strategy to balance cost, latency, and reasoning capa
 The system utilizes two distinct collections within Qdrant to handle different aspects of the RAG pipeline:
 - **`documents`**: Stores the processed chunks of uploaded documents (PDFs, Markdown, etc.) for retrieval during the synthesis phase.
 - **`semantic_cache`**: Stores previously asked user questions. When a question is asked, its embedding is compared against this collection. If a match is found, the pre-stored answer and sources (kept in the point's metadata) are returned instantly, bypassing the entire generation pipeline.
-
 
 
 ### Tech Stack
