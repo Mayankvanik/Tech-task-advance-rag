@@ -1,5 +1,6 @@
 """
 LangGraph Orchestrator — wires all agents into a StateGraph.
+Streaming: stream_pipeline() uses astream_events(v2) to yield only synthesize tokens.
 
 Optimized parallel flow:
 
@@ -16,8 +17,11 @@ Optimized parallel flow:
                                memory_manager  ──► END
 """
 
+import json
+from typing import AsyncGenerator
 from langgraph.graph import StateGraph, END, START
 from app.core.state import ConversationState
+from app.db.semantic_cache import check_cache, store_cache
 from app.agents.agents import (
     query_understanding_agent,
     query_rewriting_agent,
@@ -129,49 +133,6 @@ async def run_pipeline(
     chat_history: list[dict],
     conversation_summary: str | None = None,
 ) -> dict:
-    """Run the full RAG pipeline and return response + sources."""
-    graph = get_graph()
-
-    initial_state: ConversationState = {
-        "session_id": session_id,
-        "user_id": user_id,
-        "query": query,
-        "rewritten_query": None,
-        "needs_rewrite": False,
-        "retrieval_strategy": "hybrid",
-        "prefetched_docs": [],
-        "retrieved_docs": [],
-        "chat_history": chat_history,
-        "conversation_summary": conversation_summary,
-        "response": "",
-        "sources": [],
-        "messages": [],
-    }
-
-    final_state = await graph.ainvoke(initial_state)
-
-    return {
-        "response": final_state["response"],
-        "sources": final_state["sources"],
-        "rewritten_query": final_state.get("rewritten_query"),
-        "retrieval_strategy": final_state.get("retrieval_strategy"),
-    }
-
-# ── Only the run_pipeline function changes in graph.py ────────────────────────
-# Add these two imports at the top of graph.py:
-#
-from app.db.semantic_cache import check_cache, store_cache
-#
-# app\db\semantic_cache.py
-# Then replace run_pipeline with this:
-
-async def run_pipeline(
-    session_id: str,
-    user_id: str,
-    query: str,
-    chat_history: list[dict],
-    conversation_summary: str | None = None,
-) -> dict:
     """Run pipeline — checks semantic cache first, skips agents on hit."""
 
     # ── Cache check (before touching LangGraph) ───────────────────────────────
@@ -181,7 +142,7 @@ async def run_pipeline(
             "response": cached["answer"],
             "sources": cached["sources"],
             "rewritten_query": None,
-            "retrieval_strategy": "cache",          # signals a cache hit to caller
+            "retrieval_strategy": "cache",
             "from_cache": True,
             "cache_score": cached["cache_score"],
             "cached_query": cached["cached_query"],
@@ -208,7 +169,6 @@ async def run_pipeline(
 
     final_state = await graph.ainvoke(initial_state)
 
-    # ── Store result in cache for future similar queries ──────────────────────
     store_cache(query, final_state["response"], final_state["sources"])
 
     return {
@@ -218,3 +178,89 @@ async def run_pipeline(
         "retrieval_strategy": final_state.get("retrieval_strategy"),
         "from_cache": False,
     }
+
+
+async def stream_pipeline(
+    session_id: str,
+    user_id: str,
+    query: str,
+    chat_history: list[dict],
+    conversation_summary: str | None = None,
+) -> AsyncGenerator[str, None]:
+    """Stream only the synthesize agent tokens via SSE.
+
+    Yields newline-delimited JSON strings:
+      - Token chunks: {"type": "token", "content": "..."}
+      - Final metadata: {"type": "done", "sources": [...], "rewritten_query": ...,
+                         "retrieval_strategy": ..., "from_cache": bool}
+      - Cache hit:     {"type": "done", "from_cache": true, "response": "...", ...}
+    """
+
+    # ── Cache check — return immediately without streaming ────────────────────
+    cached = check_cache(query)
+    if cached:
+        yield json.dumps({
+            "type": "done",
+            "response": cached["answer"],
+            "sources": cached["sources"],
+            "rewritten_query": None,
+            "retrieval_strategy": "cache",
+            "from_cache": True,
+            "cache_score": cached["cache_score"],
+            "cached_query": cached["cached_query"],
+        }) + "\n"
+        return
+
+    # ── Full pipeline — stream synthesize tokens ──────────────────────────────
+    graph = get_graph()
+
+    initial_state: ConversationState = {
+        "session_id": session_id,
+        "user_id": user_id,
+        "query": query,
+        "rewritten_query": None,
+        "needs_rewrite": False,
+        "retrieval_strategy": "hybrid",
+        "prefetched_docs": [],
+        "retrieved_docs": [],
+        "chat_history": chat_history,
+        "conversation_summary": conversation_summary,
+        "response": "",
+        "sources": [],
+        "messages": [],
+    }
+
+    full_response = ""
+    final_state = None
+
+    async for event in graph.astream_events(initial_state, version="v2"):
+        kind = event["event"]
+        tags = event.get("tags", []) or []
+        metadata = event.get("metadata", {}) or {}
+
+        # LangGraph tags the node name in metadata["langgraph_node"]
+        node = metadata.get("langgraph_node", "")
+
+        # ── Stream tokens only from synthesize node ───────────────────────────
+        if kind == "on_chat_model_stream" and node == "synthesize":
+            chunk = event["data"]["chunk"]
+            token = chunk.content  # AIMessageChunk.content
+            if token:
+                full_response += token
+                yield json.dumps({"type": "token", "content": token}) + "\n"
+
+        # ── Capture final graph state after all nodes finish ──────────────────
+        elif kind == "on_chain_end" and event.get("name") == "LangGraph":
+            final_state = event["data"].get("output", {})
+
+    # ── Store in cache and emit metadata chunk ────────────────────────────────
+    sources = final_state.get("sources", []) if final_state else []
+    store_cache(query, full_response, sources)
+
+    yield json.dumps({
+        "type": "done",
+        "sources": sources,
+        "rewritten_query": final_state.get("rewritten_query") if final_state else None,
+        "retrieval_strategy": final_state.get("retrieval_strategy") if final_state else None,
+        "from_cache": False,
+    }) + "\n"

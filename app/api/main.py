@@ -4,6 +4,7 @@ import tempfile
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
@@ -15,7 +16,7 @@ from app.db.sqlite_store import (
 )
 from app.db.vector_store import get_vector_store
 from app.ingestion.document_processor import parse_document
-from app.agents.graph import run_pipeline
+from app.agents.graph import run_pipeline, stream_pipeline
 
 from dotenv import load_dotenv
 load_dotenv() 
@@ -181,7 +182,72 @@ async def chat(body: ChatRequest):
     )
 
 
-# ── Health ────────────────────────────────────────────────────────────────────
+# ── Chat (Streaming) ──────────────────────────────────────────────────────────────
+
+@app.post("/chat/stream", summary="Send a message and stream the synthesize response")
+async def chat_stream(body: ChatRequest):
+    """SSE endpoint: streams synthesize tokens as newline-delimited JSON.
+
+    Each chunk is one of:
+      {"type": "token",  "content": "<text>"}          — synthesize token
+      {"type": "done",   "sources": [...], ...}         — final metadata
+    On a cache hit, only a single {"type": "done", "from_cache": true, ...} is sent.
+    """
+    logger.info(
+        f"Stream chat request from user_id: {body.user_id} "
+        f"for session_id: {body.session_id}"
+    )
+    session = get_session(body.session_id)
+    if not session:
+        logger.warning(f"Stream chat failed: Session not found ({body.session_id})")
+        raise HTTPException(404, "Session not found")
+
+    if session["user_id"] != body.user_id:
+        logger.warning(
+            f"Stream chat failed: User {body.user_id} does not own "
+            f"session {body.session_id}"
+        )
+        raise HTTPException(403, "User does not own this session")
+
+    history = get_messages(body.session_id, limit=settings.max_context_messages)
+    summary = session.get("summary")
+
+    # Accumulate tokens so we can persist the full response after streaming
+    full_response_parts: list[str] = []
+
+    async def event_generator():
+        async for chunk in stream_pipeline(
+            session_id=body.session_id,
+            user_id=body.user_id,
+            query=body.query,
+            chat_history=history,
+            conversation_summary=summary,
+        ):
+            import json as _json
+            try:
+                data = _json.loads(chunk)
+                if data.get("type") == "token":
+                    full_response_parts.append(data["content"])
+                elif data.get("type") == "done":
+                    # Persist messages once streaming is finished
+                    final_response = (
+                        data.get("response")          # cache-hit path
+                        or "".join(full_response_parts)  # stream path
+                    )
+                    add_message(body.session_id, "user", body.query)
+                    add_message(body.session_id, "assistant", final_response)
+            except Exception:
+                pass
+            yield chunk
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="application/x-ndjson",
+        headers={"X-Accel-Buffering": "no"},  # disable nginx buffering for SSE
+    )
+
+
+# ── Health ────────────────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():

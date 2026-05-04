@@ -1,5 +1,6 @@
 import streamlit as st
 import requests
+import json
 from pathlib import Path
 
 API_BASE = "http://localhost:8000"
@@ -95,39 +96,79 @@ else:
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # Call API
+        # Call streaming API
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                resp = requests.post(
-                    f"{API_BASE}/chat",
-                    json={
-                        "session_id": st.session_state.session_id,
-                        "user_id": st.session_state.user_id,
-                        "query": prompt,
-                    },
-                )
+            payload = {
+                "session_id": st.session_state.session_id,
+                "user_id": st.session_state.user_id,
+                "query": prompt,
+            }
 
-            if resp.ok:
-                data = resp.json()
-                answer = data["response"]
-                st.markdown(answer)
+            done_meta: dict = {}       # filled by the generator's side-effect
+            answer_parts: list[str] = []
 
-                # Show sources in expander
-                if data.get("sources"):
-                    with st.expander(f"📚 Sources ({len(data['sources'])})", expanded=False):
-                        for s in data["sources"]:
+            def token_generator():
+                """Yield text tokens from /chat/stream; capture done metadata."""
+                with requests.post(
+                    f"{API_BASE}/chat/stream",
+                    json=payload,
+                    stream=True,
+                    timeout=120,
+                ) as r:
+                    r.raise_for_status()
+                    for raw_line in r.iter_lines():
+                        if not raw_line:
+                            continue
+                        try:
+                            chunk = json.loads(raw_line)
+                        except json.JSONDecodeError:
+                            continue
+
+                        if chunk.get("type") == "token":
+                            token = chunk["content"]
+                            answer_parts.append(token)
+                            yield token                  # Streamlit renders this live
+
+                        elif chunk.get("type") == "done":
+                            done_meta.update(chunk)      # capture sources / metadata
+                            # cache hit: no tokens were streamed — yield full response
+                            if chunk.get("from_cache") and chunk.get("response"):
+                                answer_parts.append(chunk["response"])
+                                yield chunk["response"]
+
+            try:
+                # st.write_stream() consumes the generator and renders tokens live
+                st.write_stream(token_generator())
+                answer = "".join(answer_parts)
+
+                # ── Sources ───────────────────────────────────────────────────
+                if done_meta.get("sources"):
+                    with st.expander(
+                        f"📚 Sources ({len(done_meta['sources'])})", expanded=False
+                    ):
+                        for s in done_meta["sources"]:
                             st.markdown(
                                 f"**[{s['index']}]** `{s['source']}` — "
                                 f"*{s.get('section', '')}* (score: {s['score']})"
                             )
 
-                # Show debug info
-                if data.get("rewritten_query") and data["rewritten_query"] != prompt:
+                # ── Cache hit badge ───────────────────────────────────────────
+                if done_meta.get("from_cache"):
+                    st.caption(
+                        f"⚡ Answered from semantic cache "
+                        f"(score: {done_meta.get('cache_score', ''):.2f})"
+                    )
+
+                # ── Rewrite debug ─────────────────────────────────────────────
+                rq = done_meta.get("rewritten_query")
+                if rq and rq != prompt:
                     with st.expander("🔄 Query rewritten", expanded=False):
-                        st.caption(data["rewritten_query"])
+                        st.caption(rq)
 
                 st.session_state.messages.append({"role": "assistant", "content": answer})
-            else:
-                err = f"Error: {resp.status_code} — {resp.text}"
+
+            except Exception as e:
+                err = f"Stream error: {e}"
                 st.error(err)
                 st.session_state.messages.append({"role": "assistant", "content": err})
+

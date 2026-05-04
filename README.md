@@ -6,30 +6,50 @@ Multi-user RAG system with LangGraph orchestration, persistent memory, and hybri
 
 ## Architecture
 
-```
-User → Streamlit UI → FastAPI → LangGraph Pipeline → Qdrant + SQLite
+```text
+User → Streamlit UI → FastAPI → Semantic Cache (Hit? → Return) → LangGraph Pipeline → Qdrant + SQLite
 ```
 
 ### LangGraph Agent Flow
 
-```
-query_understanding
-        │
-        ├─ needs_rewrite? ─→ query_rewriting
-        │                           │
-        └───────────────────────────┘
-                    │
-           retrieval_router
-                    │
-               retriever   (Qdrant: semantic / keyword / hybrid+BM25)
-                    │
-          context_synthesis  (GPT-4o-mini)
-                    │
-        ├─ long conv? ─→ conversation_summary  (SQLite persist)
-        │
-     memory_manager
-        │
-       END
+```text
+                 START
+                   │
+            ┌──────┴──────┐
+            │             │
+       understand      prefetch (Hybrid Search)
+            │             │
+            └──────┬──────┘
+                   │
+                 decide
+                   │
+            should_rewrite?
+                   │
+            ┌──────┴──────┐
+          (no)          (yes)
+            │             │
+            │          rewrite
+            │             │
+            │           route
+            │             │
+            │         retrieve (Qdrant: semantic / keyword / hybrid+BM25)
+            │             │
+            └──────┬──────┘
+                   │
+               synthesize (GPT-4o-mini)
+                   │
+           should_summarize?
+                   │
+            ┌──────┴──────┐
+          (no)          (yes)
+            │             │
+            │         summarize (SQLite persist)
+            │             │
+            └──────┬──────┘
+                   │
+                 memory
+                   │
+                  END
 ```
 
 ### Tech Stack
@@ -143,6 +163,8 @@ print(resp["sources"])
 
 ## Key Design Decisions
 
+- **Semantic Caching**: Previous Q&A interactions are cached. Before invoking the LangGraph pipeline, the system checks for semantically similar queries. If found, it returns the cached response immediately, bypassing the LLM and saving time/cost.
+- **Parallel execution**: Intent detection (`understand`) and initial retrieval (`prefetch`) run concurrently from the start, minimizing latency before deciding whether to rewrite the query.
 - **Hybrid search** = Dense cosine (Qdrant) + BM25 re-rank. Balances semantic and keyword matching.
 - **Query rewriting** only triggers when history exists and the query is ambiguous — saves LLM calls.
 - **Summarization** triggers at `SUMMARY_THRESHOLD` (default 20) messages to keep context window manageable.
@@ -157,14 +179,16 @@ print(resp["sources"])
 rag_system/
 ├── app/
 │   ├── agents/
-│   │   ├── agents.py      # All 7 specialized agents
+│   │   ├── agents.py      # All 9 specialized agents
 │   │   └── graph.py       # LangGraph wiring + run_pipeline()
 │   ├── api/
 │   │   └── main.py        # FastAPI endpoints
 │   ├── core/
 │   │   ├── config.py      # Settings (pydantic-settings)
+│   │   ├── prompt.py      # System and user prompts for agents
 │   │   └── state.py       # LangGraph ConversationState
 │   ├── db/
+│   │   ├── semantic_cache.py # Semantic caching logic
 │   │   ├── sqlite_store.py  # Chat history + sessions
 │   │   └── vector_store.py  # Qdrant + BM25 hybrid search
 │   └── ingestion/
