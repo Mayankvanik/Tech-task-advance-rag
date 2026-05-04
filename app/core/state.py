@@ -20,6 +20,7 @@ class ConversationState(TypedDict):
     # Memory & history
     chat_history: list[dict]
     conversation_summary: Optional[str]
+    user_preferences: Optional[dict]   # loaded per-user from DB, injected into synthesis
 
     # Output
     response: str

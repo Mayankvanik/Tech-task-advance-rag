@@ -37,6 +37,13 @@ def init_db():
                 FOREIGN KEY (session_id) REFERENCES sessions(session_id)
             );
 
+            -- User preferences: keyed by user_id, persists across all sessions
+            CREATE TABLE IF NOT EXISTS user_preferences (
+                user_id TEXT PRIMARY KEY,
+                preferences TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
             CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
         """)
@@ -78,6 +85,41 @@ def list_user_sessions(user_id: str) -> list[dict]:
             (user_id,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ── User Preferences ─────────────────────────────────────────────────────────
+
+def get_user_preferences(user_id: str) -> dict:
+    """Return stored preferences for a user, or empty dict if none."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT preferences FROM user_preferences WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    if row:
+        try:
+            return json.loads(row["preferences"])
+        except (json.JSONDecodeError, KeyError):
+            return {}
+    return {}
+
+
+def upsert_user_preferences(user_id: str, new_prefs: dict):
+    """Merge new_prefs into existing preferences for the user (upsert)."""
+    existing = get_user_preferences(user_id)
+    merged = {**existing, **new_prefs}   # new values win on conflict
+    now = datetime.utcnow().isoformat()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_preferences (user_id, preferences, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                preferences = excluded.preferences,
+                updated_at  = excluded.updated_at
+            """,
+            (user_id, json.dumps(merged), now),
+        )
 
 
 # ── Messages ──────────────────────────────────────────────────────────────────

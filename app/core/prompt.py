@@ -37,7 +37,8 @@ CONTEXT_SYNTHESIS_SYSTEM_PROMPT = """You are an expert technical assistant. Your
 - Base your answer entirely on the provided document context and relevant conversation memory.
 - Always include inline citations using the exact [Source N] format when referencing information.
 - If the answer cannot be confidently derived from the provided context, clearly state that you do not have enough information rather than guessing.
-- Keep your formatting clean using Markdown where appropriate."""
+- Keep your formatting clean using Markdown where appropriate.
+{user_preferences_block}"""
 
 CONTEXT_SYNTHESIS_USER_PROMPT = """{memory_context}
 
@@ -62,3 +63,40 @@ Conversation:
 {history}
 
 Summary:"""
+
+
+PREFERENCE_EXTRACTION_PROMPT = """
+Analyze the conversation below and extract any explicit or implicit user preferences about how they want answers delivered.
+Only extract preferences that are clearly stated or strongly implied — do not invent them.
+
+Preferences to look for:
+- tone: "formal", "casual", "technical", "simple"
+- format: "bullet_points", "paragraphs", "step_by_step", "concise"
+- detail_level: "brief", "detailed", "comprehensive"
+- language: any specific language preference mentioned
+- other: any other notable stylistic preference
+
+Conversation:
+{history}
+
+Respond ONLY in valid JSON. Omit any key where no clear preference was expressed.
+Example: {{"tone": "technical", "format": "bullet_points", "detail_level": "brief"}}
+
+Extracted Preferences:"""
+
+
+def build_preferences_block(prefs: dict) -> str:
+    """Format user preferences into a system prompt injection string."""
+    if not prefs:
+        return ""
+    lines = ["\n\nUser Preferences (apply these to your response style):"]
+    label_map = {
+        "tone": "Tone",
+        "format": "Format",
+        "detail_level": "Detail level",
+        "language": "Language",
+    }
+    for key, val in prefs.items():
+        label = label_map.get(key, key.replace("_", " ").title())
+        lines.append(f"- {label}: {val}")
+    return "\n".join(lines)

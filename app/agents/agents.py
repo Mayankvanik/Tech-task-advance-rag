@@ -18,16 +18,18 @@ from app.core.state import ConversationState
 import logging
 logger = logging.getLogger(__name__)
 from app.db.vector_store import get_vector_store
-from app.db.sqlite_store import update_session_summary
-import json
-import re
 from app.core.prompt import (
     QUERY_UNDERSTANDING_PROMPT,
     QUERY_REWRITING_PROMPT,
     CONTEXT_SYNTHESIS_SYSTEM_PROMPT,
     CONTEXT_SYNTHESIS_USER_PROMPT,
     CONVERSATION_SUMMARY_PROMPT,
+    PREFERENCE_EXTRACTION_PROMPT,
+    build_preferences_block,
 )
+from app.db.sqlite_store import update_session_summary, upsert_user_preferences
+import json
+import re
 
 settings = get_settings()
 
@@ -186,10 +188,11 @@ def retriever_agent(state: ConversationState) -> dict:
 # ── Agent 5: Context Synthesis ────────────────────────────────────────────────
 
 def context_synthesis_agent(state: ConversationState) -> dict:
-    """Generate final answer from docs + conversation history."""
+    """Generate final answer from docs + conversation history + user preferences."""
     docs = state.get("retrieved_docs", [])
     history = _history_text(state["chat_history"])
     summary = state.get("conversation_summary", "")
+    user_preferences = state.get("user_preferences") or {}
 
     context_parts = []
     sources = []
@@ -208,7 +211,9 @@ def context_synthesis_agent(state: ConversationState) -> dict:
     if summary:
         memory_context = f"\nConversation Summary:\n{summary}\n"
 
-    system = CONTEXT_SYNTHESIS_SYSTEM_PROMPT
+    # Inject user preferences into the system prompt
+    prefs_block = build_preferences_block(user_preferences)
+    system = CONTEXT_SYNTHESIS_SYSTEM_PROMPT.format(user_preferences_block=prefs_block)
 
     user_prompt = CONTEXT_SYNTHESIS_USER_PROMPT.format(
         memory_context=memory_context,
@@ -228,20 +233,31 @@ def context_synthesis_agent(state: ConversationState) -> dict:
 # ── Agent 6: Conversation Summarization ───────────────────────────────────────
 
 def conversation_summary_agent(state: ConversationState) -> dict:
-    """Summarize conversation when it gets too long."""
+    """Summarize conversation when it gets too long, and extract user preferences."""
     history = state["chat_history"]
     if len(history) < settings.summary_threshold:
         return {}
 
     history_text = _history_text(history, limit=len(history))
-    prompt = CONVERSATION_SUMMARY_PROMPT.format(history=history_text)
 
+    # ── Summarize ─────────────────────────────────────────────────────────────────
+    prompt = CONVERSATION_SUMMARY_PROMPT.format(history=history_text)
     response = llm.invoke([HumanMessage(content=prompt)])
     logger.debug(f"conversation summary response: {response.content}")
     summary = response.content.strip()
-
-    # Persist to SQLite
     update_session_summary(state["session_id"], summary)
+
+    # ── Extract and persist user preferences ───────────────────────────────────────
+    pref_prompt = PREFERENCE_EXTRACTION_PROMPT.format(history=history_text)
+    pref_response = llm.invoke([HumanMessage(content=pref_prompt)])
+    logger.debug(f"preference extraction response: {pref_response.content}")
+    try:
+        extracted = json.loads(extract_json(pref_response.content))
+        if extracted and isinstance(extracted, dict):
+            upsert_user_preferences(state["user_id"], extracted)
+            logger.info(f"Saved preferences for user {state['user_id']}: {extracted}")
+    except Exception as e:
+        logger.warning(f"Could not extract preferences: {e}")
 
     return {"conversation_summary": summary}
 

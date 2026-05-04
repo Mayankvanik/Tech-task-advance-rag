@@ -22,6 +22,7 @@ from typing import AsyncGenerator
 from langgraph.graph import StateGraph, END, START
 from app.core.state import ConversationState
 from app.db.semantic_cache import check_cache, store_cache
+from app.db.sqlite_store import get_user_preferences
 from app.agents.agents import (
     query_understanding_agent,
     query_rewriting_agent,
@@ -150,6 +151,7 @@ async def run_pipeline(
 
     # ── Full LangGraph pipeline ───────────────────────────────────────────────
     graph = get_graph()
+    preferences = get_user_preferences(user_id)
 
     initial_state: ConversationState = {
         "session_id": session_id,
@@ -162,6 +164,7 @@ async def run_pipeline(
         "retrieved_docs": [],
         "chat_history": chat_history,
         "conversation_summary": conversation_summary,
+        "user_preferences": preferences,
         "response": "",
         "sources": [],
         "messages": [],
@@ -213,6 +216,7 @@ async def stream_pipeline(
 
     # ── Full pipeline — stream synthesize tokens ──────────────────────────────
     graph = get_graph()
+    preferences = get_user_preferences(user_id)
 
     initial_state: ConversationState = {
         "session_id": session_id,
@@ -225,6 +229,7 @@ async def stream_pipeline(
         "retrieved_docs": [],
         "chat_history": chat_history,
         "conversation_summary": conversation_summary,
+        "user_preferences": preferences,
         "response": "",
         "sources": [],
         "messages": [],
